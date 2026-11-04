@@ -1,14 +1,23 @@
 package acme
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"os"
 	"time"
+
+	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v4/providers/dns"
+	"github.com/go-acme/lego/v4/registration"
 )
 
 type IssueResult struct {
@@ -26,12 +35,88 @@ func NewDefaultIssuer() Issuer {
 	return &DefaultIssuer{}
 }
 
+type acmeUser struct {
+	Email        string
+	Registration *registration.Resource
+	key          crypto.PrivateKey
+}
+
+func (u *acmeUser) GetEmail() string {
+	return u.Email
+}
+
+func (u *acmeUser) GetRegistration() *registration.Resource {
+	return u.Registration
+}
+
+func (u *acmeUser) GetPrivateKey() crypto.PrivateKey {
+	return u.key
+}
+
 func (i *DefaultIssuer) IssueCertificate(domain string, providerType string, credentialsJSON string) (*IssueResult, error) {
 	if providerType == "local_self_signed" || providerType == "mock" || providerType == "" {
 		return generateSelfSignedCert(domain)
 	}
 
-	return generateSelfSignedCert(domain)
+	// Parse JSON credentials and set as env vars for lego provider
+	if credentialsJSON != "" {
+		var creds map[string]string
+		if err := json.Unmarshal([]byte(credentialsJSON), &creds); err == nil {
+			for k, v := range creds {
+				os.Setenv(k, v)
+			}
+		}
+	}
+
+	// Create private key for ACME user
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	user := &acmeUser{
+		Email: "admin@" + domain,
+		key:   privateKey,
+	}
+
+	config := lego.NewConfig(user)
+	config.CADirURL = lego.LEDirectoryProduction
+	config.Certificate.KeyType = "p256"
+
+	client, err := lego.NewClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create lego client: %w", err)
+	}
+
+	provider, err := dns.NewDNSChallengeProviderByName(providerType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DNS provider '%s': %w", providerType, err)
+	}
+
+	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
+		return nil, fmt.Errorf("failed to set DNS01 provider: %w", err)
+	}
+
+	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	if err != nil {
+		return nil, fmt.Errorf("ACME registration failed: %w", err)
+	}
+	user.Registration = reg
+
+	request := certificate.ObtainRequest{
+		Domains: []string{domain},
+		Bundle:  true,
+	}
+
+	certificates, err := client.Certificate.Obtain(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to obtain certificate via ACME: %w", err)
+	}
+
+	return &IssueResult{
+		CertPEM: string(certificates.Certificate),
+		KeyPEM:  string(certificates.PrivateKey),
+	}, nil
 }
 
 func generateSelfSignedCert(domain string) (*IssueResult, error) {

@@ -2,6 +2,8 @@ package store
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -192,10 +194,13 @@ func (s *Store) ExchangeBootstrapToken(token, hostname, osName, arch, remoteIP s
 	_, _ = rand.Read(secretBytes)
 	nodeSecret := hex.EncodeToString(secretBytes)
 
+	hashBytes := sha256.Sum256([]byte(nodeSecret))
+	secretHash := hex.EncodeToString(hashBytes[:])
+
 	now := time.Now().Unix()
 	_, err = tx.Exec(
 		`INSERT INTO nodes (id, secret_hash, hostname, os, arch, remote_ip, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		nodeID, nodeSecret, hostname, osName, arch, remoteIP, now, now,
+		nodeID, secretHash, hostname, osName, arch, remoteIP, now, now,
 	)
 	if err != nil {
 		return "", "", err
@@ -205,9 +210,15 @@ func (s *Store) ExchangeBootstrapToken(token, hostname, osName, arch, remoteIP s
 }
 
 func (s *Store) AuthenticateNode(nodeID, secret, remoteIP string) bool {
-	var storedSecret string
-	err := s.db.QueryRow(`SELECT secret_hash FROM nodes WHERE id = ?`, nodeID).Scan(&storedSecret)
-	if err != nil || storedSecret != secret {
+	var storedHash string
+	err := s.db.QueryRow(`SELECT secret_hash FROM nodes WHERE id = ?`, nodeID).Scan(&storedHash)
+	if err != nil {
+		return false
+	}
+	hashBytes := sha256.Sum256([]byte(secret))
+	computedHash := hex.EncodeToString(hashBytes[:])
+
+	if subtle.ConstantTimeCompare([]byte(storedHash), []byte(computedHash)) != 1 {
 		return false
 	}
 	_, _ = s.db.Exec(`UPDATE nodes SET last_seen = ?, remote_ip = ? WHERE id = ?`, time.Now().Unix(), remoteIP, nodeID)

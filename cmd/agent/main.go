@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -37,7 +38,15 @@ func main() {
 	srv := flag.String("server", "http://127.0.0.1:8080", "server url")
 	boot := flag.String("bootstrap", "", "bootstrap token")
 	state := flag.String("state", "agent_identity.json", "state file")
+	requireTLS := flag.Bool("require-tls", false, "require TLS (wss://) for connection")
 	flag.Parse()
+
+	if strings.HasPrefix(*srv, "http://") {
+		if *requireTLS {
+			log.Fatalf("[FATAL] Plain HTTP/WS connections rejected due to -require-tls flag. Provide an https:// server URL.")
+		}
+		log.Printf("[WARNING] Agent is connecting via unencrypted HTTP/WS (%s). Pass https:// server URL in production for WSS encryption!", *srv)
+	}
 
 	id, err := loadOrRegister(*srv, *boot, *state)
 	if err != nil {
@@ -368,10 +377,21 @@ func buildCaddyConfig(payload protocol.CaddySyncPayload) map[string]interface{} 
 	}
 }
 
+func isValidStackName(name string) bool {
+	// Only allow alphanumeric, underscore, and hyphen characters
+	matched, _ := regexp.MatchString(`^[a-zA-Z0-9_-]+$`, name)
+	return matched
+}
+
 func handleComposeDeploy(w http.ResponseWriter, r *http.Request) {
 	var req protocol.ComposeDeployRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	if !isValidStackName(req.Name) {
+		http.Error(w, "Invalid stack name: only alphanumeric characters, underscore, and hyphen are allowed", 400)
 		return
 	}
 

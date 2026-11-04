@@ -3,16 +3,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"io"
 	"io/fs"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,10 +42,65 @@ type ControlPlane struct {
 	sessions sync.Map
 }
 
+func generateRandomPassword(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func adminAuthMiddleware(adminPassword string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Public agent endpoints do not require admin auth
+		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Allow unauthenticated access ONLY to static web root UI assets (index.html, js, css, etc.)
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Verify API requests via HTTP Basic Auth or Authorization: Bearer <adminPassword> or X-Admin-Key
+		user, pass, ok := r.BasicAuth()
+		if ok && (subtle.ConstantTimeCompare([]byte(pass), []byte(adminPassword)) == 1 || subtle.ConstantTimeCompare([]byte(user), []byte(adminPassword)) == 1) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(token), []byte(adminPassword)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		adminKeyHeader := r.Header.Get("X-Admin-Key")
+		if adminKeyHeader != "" && subtle.ConstantTimeCompare([]byte(adminKeyHeader), []byte(adminPassword)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="Fleet Management Admin"`)
+		http.Error(w, "Unauthorized: Admin Authentication Required", http.StatusUnauthorized)
+	})
+}
+
 func main() {
 	addr := flag.String("listen", ":8080", "listen addr")
 	dbPath := flag.String("db", "fleet.db", "sqlite path")
+	adminPass := flag.String("admin-pass", os.Getenv("FLEET_ADMIN_PASS"), "admin authentication password")
 	flag.Parse()
+
+	if *adminPass == "" {
+		*adminPass = generateRandomPassword(16)
+	}
 
 	db, err := store.NewSQLiteStore(*dbPath)
 	if err != nil {
@@ -53,8 +113,11 @@ func main() {
 		log.Fatalf("token err: %v", err)
 	}
 
+	go startFailoverInspector(cp)
+
 	log.Println("====================================================")
 	log.Printf("Control Plane listening on %s", *addr)
+	log.Printf("Admin Password: %s", *adminPass)
 	log.Printf("Bootstrap Token: %s", bootToken)
 	log.Printf("Run Agent:\ngo run ./cmd/agent -server http://127.0.0.1%s -bootstrap %s", *addr, bootToken)
 	log.Println("====================================================")
@@ -81,7 +144,8 @@ func main() {
 	mux.HandleFunc("POST /api/v1/stacks", cp.handleCreateStack)
 	mux.HandleFunc("POST /api/v1/nodes/{id}/keepalive", cp.handleNodeKeepalive)
 
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	handler := adminAuthMiddleware(*adminPass, mux)
+	log.Fatal(http.ListenAndServe(*addr, handler))
 }
 
 func (cp *ControlPlane) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +193,7 @@ func (cp *ControlPlane) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[+] Tunnel connected (reversed): %s", nodeID)
 
 	<-session.CloseChan()
-	cp.sessions.Delete(nodeID)
+	cp.sessions.CompareAndDelete(nodeID, session)
 	log.Printf("[-] Tunnel disconnected: %s", nodeID)
 }
 
@@ -280,9 +344,15 @@ func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Reques
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		// Fetch DNS provider credentials from database
+		dnsProvider, err := cp.store.GetDNSProvider(req.DNSProviderID)
+		if err != nil {
+			http.Error(w, "DNS provider not found", 404)
+			return
+		}
 		// Use acme issuer to generate cert/key in memory
 		issuer := acme.NewDefaultIssuer()
-		result, err := issuer.IssueCertificate(req.Domain, req.ACMEEnv, "")
+		result, err := issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
