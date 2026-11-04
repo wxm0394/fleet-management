@@ -1,0 +1,20 @@
+# Project: Multi-VPS Fleet Management System (Control Plane + Outbound Agent)
+
+## Core Architecture Rules
+1. **Outbound Connection Reversal ONLY**:
+   - Never make the Server SSH or dial directly into Agent IPs (Agents are behind NAT/CGNAT).
+   - Agents initiate an outbound WebSocket (`WSS`) connection to the Server.
+   - Wrap the WebSocket into a `net.Conn` and invert roles via `hashicorp/yamux`:
+     - Agent runs `yamux.Server(wsNetConn, config)` (acts as Listener).
+     - Control Plane Server runs `yamux.Client(wsNetConn, config)` (acts as Dialer).
+2. **Primary Key & ID Standard**:
+   - All entity IDs (Nodes, Tokens, Audit Logs, Tasks, Certs) MUST use **UUIDv7** (`github.com/google/uuid` -> `uuid.NewV7()`).
+   - Never use UUIDv4 or Snowflake.
+   - In SQLite tables using `TEXT PRIMARY KEY` with UUIDv7, append `WITHOUT ROWID` to avoid redundant B-Tree index overhead.
+3. **Database & CGO**:
+   - Use pure-Go SQLite (`modernc.org/sqlite`) so both Server and Agent compile with `CGO_ENABLED=0`.
+   - Always enable `PRAGMA journal_mode=WAL;` and `PRAGMA synchronous=NORMAL;`.
+4. **Lightweight Agent**:
+   - Keep Agent memory footprint under 15MB.
+   - Collect host metrics via `github.com/shirou/gopsutil/v4`.
+   - Everything is Container-Native (Docker Compose + Caddy Admin API); do not write legacy host-level PHP/MySQL/systemd parsers.
