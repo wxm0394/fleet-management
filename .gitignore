@@ -2,3 +2,10 @@
 *.db-shm
 *.db-wal
 agent_identity.json
+dist/
+fleet-server*
+fleet-agent*
+server
+agent
+*.tmp
+*.log
