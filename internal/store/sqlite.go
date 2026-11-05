@@ -4,9 +4,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -309,8 +312,20 @@ func (s *Store) CreateCertificate(domain, dnsProviderID, acmeEnv, certPEM, keyPE
 	if err != nil {
 		return "", err
 	}
+
+	// Parse x509 certificate to get real expiration time
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return "", fmt.Errorf("failed to decode PEM certificate")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	expiresAt := cert.NotAfter.Unix()
 	now := time.Now().Unix()
-	expiresAt := now + 30*24*60*60 // 1 month default
 	_, err = s.db.Exec(
 		`INSERT INTO certificates (id, domain, dns_provider_id, acme_env, cert_pem, key_pem, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		id.String(), domain, dnsProviderID, acmeEnv, certPEM, keyPEM, expiresAt, now,
@@ -349,10 +364,45 @@ func (s *Store) ListCertificates() ([]CertificateRecord, error) {
 	return list, nil
 }
 
+// ListExpiringCertificates returns certificates expiring within the given threshold
+func (s *Store) ListExpiringCertificates(threshold time.Duration) ([]CertificateRecord, error) {
+	cutoff := time.Now().Add(threshold).Unix()
+	rows, err := s.db.Query(
+		`SELECT id, domain, dns_provider_id, acme_env, cert_pem, key_pem, expires_at, created_at FROM certificates WHERE expires_at < ? ORDER BY expires_at ASC`, cutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []CertificateRecord
+	for rows.Next() {
+		var r CertificateRecord
+		if err := rows.Scan(&r.ID, &r.Domain, &r.DNSProviderID, &r.ACMEEnv, &r.CertPEM, &r.KeyPEM, &r.ExpiresAt, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, r)
+	}
+	return list, nil
+}
+
 func (s *Store) UpdateCertificate(id, domain, dnsProviderID, acmeEnv, certPEM, keyPEM string) error {
-	_, err := s.db.Exec(
-		`UPDATE certificates SET domain = ?, dns_provider_id = ?, acme_env = ?, cert_pem = ?, key_pem = ? WHERE id = ?`,
-		domain, dnsProviderID, acmeEnv, certPEM, keyPEM, id,
+	// Parse x509 certificate to get real expiration time
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return fmt.Errorf("failed to decode PEM certificate")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	expiresAt := cert.NotAfter.Unix()
+
+	_, err = s.db.Exec(
+		`UPDATE certificates SET domain = ?, dns_provider_id = ?, acme_env = ?, cert_pem = ?, key_pem = ?, expires_at = ? WHERE id = ?`,
+		domain, dnsProviderID, acmeEnv, certPEM, keyPEM, expiresAt, id,
 	)
 	return err
 }

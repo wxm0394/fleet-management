@@ -39,9 +39,10 @@ var upgrader = websocket.Upgrader{
 }
 
 type ControlPlane struct {
-	store    *store.Store
-	issuer   acme.Issuer
-	sessions sync.Map
+	store         *store.Store
+	issuer        acme.Issuer
+	renewingCerts sync.Map
+	sessions      sync.Map
 }
 
 func generateRandomPassword(length int) string {
@@ -126,6 +127,7 @@ func main() {
 	}
 
 	go startFailoverInspector(cp)
+	go startCertRenewalInspector(cp)
 
 	log.Println("====================================================")
 	log.Printf("Control Plane listening on %s", *addr)
@@ -319,6 +321,65 @@ func (cp *ControlPlane) newAgentClient(nodeID string) (*http.Client, error) {
 	}, nil
 }
 
+func (cp *ControlPlane) syncCaddyToNode(nodeID string) error {
+	val, ok := cp.sessions.Load(nodeID)
+	if !ok {
+		return fmt.Errorf("node %s not connected", nodeID)
+	}
+	session := val.(*yamux.Session)
+
+	routes, err := cp.store.ListProxyRoutes()
+	if err != nil {
+		return fmt.Errorf("failed to list proxy routes: %w", err)
+	}
+
+	var routeRules []protocol.RouteRule
+	var certs []protocol.CertPair
+	certMap := make(map[string]bool)
+
+	for _, r := range routes {
+		if r.NodeID == nodeID {
+			routeRules = append(routeRules, protocol.RouteRule{
+				ID:       r.ID,
+				Domain:   r.Domain,
+				Upstream: r.Upstream,
+			})
+			if r.CertID != "" && !certMap[r.CertID] {
+				certMap[r.CertID] = true
+				cert, _ := cp.store.GetCertificate(r.CertID)
+				if cert != nil {
+					certs = append(certs, protocol.CertPair{
+						CertPEM: cert.CertPEM,
+						KeyPEM:  cert.KeyPEM,
+					})
+				}
+			}
+		}
+	}
+
+	payload := protocol.CaddySyncPayload{
+		Routes:       routeRules,
+		Certificates: certs,
+		DryRun:       false,
+	}
+	payloadJSON, _ := json.Marshal(payload)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return session.Open()
+			},
+		},
+	}
+	resp, err := client.Post("http://agent/rpc/caddy/sync", "application/json", bytes.NewReader(payloadJSON))
+	if err != nil {
+		return fmt.Errorf("failed to sync caddy to agent %s: %w", nodeID, err)
+	}
+	resp.Body.Close()
+	log.Printf("[+] Caddy sync sent to agent %s", nodeID)
+	return nil
+}
+
 func (cp *ControlPlane) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	tok, err := cp.store.CreateBootstrapToken(time.Hour)
 	if err != nil {
@@ -492,47 +553,8 @@ func (cp *ControlPlane) handleProxyRoutes(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		if s, ok := cp.sessions.Load(req.NodeID); ok {
-			session := s.(*yamux.Session)
-			cert, _ := cp.store.GetCertificate(req.CertID)
-			routes, _ := cp.store.ListProxyRoutes()
-			var routeRules []protocol.RouteRule
-			for _, r := range routes {
-				if r.NodeID == req.NodeID {
-					routeRules = append(routeRules, protocol.RouteRule{
-						ID:       r.ID,
-						Domain:   r.Domain,
-						Upstream: r.Upstream,
-					})
-				}
-			}
-			var certs []protocol.CertPair
-			if cert != nil {
-				certs = []protocol.CertPair{
-					{CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM},
-				}
-			}
-			payload := protocol.CaddySyncPayload{
-				Routes:       routeRules,
-				Certificates: certs,
-				DryRun:       false,
-			}
-			payloadJSON, _ := json.Marshal(payload)
-			client := &http.Client{
-				Timeout: 5 * time.Second,
-				Transport: &http.Transport{
-					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-						return session.Open()
-					},
-				},
-			}
-			resp, err := client.Post("http://agent/rpc/caddy/sync", "application/json", bytes.NewReader(payloadJSON))
-			if err != nil {
-				log.Printf("[!] Failed to sync caddy to agent %s: %v", req.NodeID, err)
-			} else {
-				resp.Body.Close()
-				log.Printf("[+] Caddy sync sent to agent %s", req.NodeID)
-			}
+		if err := cp.syncCaddyToNode(req.NodeID); err != nil {
+			log.Printf("[!] Failed to sync caddy to agent %s: %v", req.NodeID, err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"id": routeID})
@@ -609,6 +631,69 @@ func (cp *ControlPlane) handleNodeKeepalive(w http.ResponseWriter, r *http.Reque
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func startCertRenewalInspector(cp *ControlPlane) {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Get certificates expiring within 20 days
+		expiringCerts, err := cp.store.ListExpiringCertificates(20 * 24 * time.Hour)
+		if err != nil {
+			log.Printf("[!] Failed to list expiring certificates: %v", err)
+			continue
+		}
+
+		for _, cert := range expiringCerts {
+			// Skip if already renewing this domain
+			if _, renewing := cp.renewingCerts.Load(cert.Domain); renewing {
+				continue
+			}
+
+			// Mark as renewing
+			cp.renewingCerts.Store(cert.Domain, true)
+
+			// Renew the certificate in background
+			go func(certRecord store.CertificateRecord) {
+				defer cp.renewingCerts.Delete(certRecord.Domain)
+
+				dnsProvider, err := cp.store.GetDNSProvider(certRecord.DNSProviderID)
+				if err != nil {
+					log.Printf("[!] Failed to get DNS provider %s for domain %s: %v", certRecord.DNSProviderID, certRecord.Domain, err)
+					return
+				}
+
+				result, err := cp.issuer.IssueCertificate(certRecord.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON, certRecord.ACMEEnv)
+				if err != nil {
+					log.Printf("[!] Failed to auto-renew certificate for domain %s: %v", certRecord.Domain, err)
+					return
+				}
+
+				if err := cp.store.UpdateCertificate(certRecord.ID, certRecord.Domain, certRecord.DNSProviderID, certRecord.ACMEEnv, result.CertPEM, result.KeyPEM); err != nil {
+					log.Printf("[!] Failed to update renewed certificate for domain %s: %v", certRecord.Domain, err)
+					return
+				}
+
+				routes, err := cp.store.ListProxyRoutes()
+				if err != nil {
+					log.Printf("[!] Failed to list routes during cert renewal for domain %s: %v", certRecord.Domain, err)
+					return
+				}
+
+				syncedNodes := make(map[string]bool)
+				for _, route := range routes {
+					if route.CertID == certRecord.ID && !syncedNodes[route.NodeID] {
+						syncedNodes[route.NodeID] = true
+						if err := cp.syncCaddyToNode(route.NodeID); err != nil {
+							log.Printf("[!] Failed to sync renewed cert to node %s: %v", route.NodeID, err)
+						}
+					}
+				}
+				log.Printf("[+] Certificate auto-renewed successfully for domain %s", certRecord.Domain)
+			}(cert)
+		}
+	}
 }
 
 func startFailoverInspector(cp *ControlPlane) {
