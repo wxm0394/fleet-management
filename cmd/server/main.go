@@ -40,6 +40,7 @@ var upgrader = websocket.Upgrader{
 
 type ControlPlane struct {
 	store    *store.Store
+	issuer   acme.Issuer
 	sessions sync.Map
 }
 
@@ -115,7 +116,10 @@ func main() {
 		log.Fatalf("sqlite err: %v", err)
 	}
 
-	cp := &ControlPlane{store: db}
+	cp := &ControlPlane{
+		store:  db,
+		issuer: acme.NewDefaultIssuer(),
+	}
 	bootToken, err := db.CreateBootstrapToken(24 * time.Hour)
 	if err != nil {
 		log.Fatalf("token err: %v", err)
@@ -447,8 +451,7 @@ func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "DNS provider not found", 404)
 			return
 		}
-		issuer := acme.NewDefaultIssuer()
-		result, err := issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON, req.ACMEEnv)
+		result, err := cp.issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON, req.ACMEEnv)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
