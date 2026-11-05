@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en" class="dark">
+<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Fleet Management Dashboard</title>
@@ -146,6 +147,43 @@
     </div>
 
     <script>
+        // Admin Key storage and fetch wrapper
+        let adminKey = sessionStorage.getItem('adminKey');
+
+        function getAdminKey() {
+            if (!adminKey) {
+                const key = prompt('Please enter Admin Password:');
+                if (key) {
+                    adminKey = key;
+                    sessionStorage.setItem('adminKey', adminKey);
+                }
+            }
+            return adminKey;
+        }
+
+        async function apiFetch(url, options = {}) {
+            const key = getAdminKey();
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(key ? { 'X-Admin-Key': key } : {}),
+                ...(options.headers || {})
+            };
+
+            const response = await fetch(url, { ...options, headers });
+
+            if (response.status === 401) {
+                sessionStorage.removeItem('adminKey');
+                adminKey = null;
+                const newKey = prompt('Authentication failed (401). Please re-enter Admin Password:');
+                if (newKey) {
+                    adminKey = newKey;
+                    sessionStorage.setItem('adminKey', adminKey);
+                    return apiFetch(url, options);
+                }
+            }
+            return response;
+        }
+
         // Tab navigation
         const tabBtns = document.querySelectorAll('.tab-btn');
         const nodesContainer = document.getElementById('nodes-container');
@@ -242,14 +280,15 @@
         // Fetch nodes and update UI
         async function fetchNodes() {
             try {
-                const response = await fetch('/api/v1/nodes');
+                const response = await apiFetch('/api/v1/nodes');
+                if (!response.ok) return;
                 const nodes = await response.json();
                 nodesContainer.innerHTML = '';
 
                 for (const node of nodes) {
                     if (node.online) {
                         try {
-                            const metricsResponse = await fetch(`/api/v1/nodes/${node.id}/metrics`);
+                            const metricsResponse = await apiFetch(`/api/v1/nodes/${node.id}/metrics`);
                             if (metricsResponse.ok) {
                                 const metrics = await metricsResponse.json();
                                 node.cpuPercent = metrics.cpuPercent ?? node.cpuPercent;
@@ -273,7 +312,8 @@
         // Generate new node token
         document.getElementById('generate-token').addEventListener('click', async () => {
             try {
-                const response = await fetch('/api/v1/tokens', { method: 'POST' });
+                const response = await apiFetch('/api/v1/tokens', { method: 'POST' });
+                if (!response.ok) return;
                 const data = await response.json();
                 const token = data.bootstrap_token;
                 
@@ -333,7 +373,7 @@ Copy the appropriate command above to install your agent!`;
                 });
             }
 
-            // Connect to WebSocket
+            // Connect to WebSocket with token or admin key if applicable
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const host = window.location.host;
             socket = new WebSocket(`${protocol}//${host}/api/v1/nodes/${nodeId}/pty`);
@@ -362,7 +402,8 @@ Copy the appropriate command above to install your agent!`;
         // DNS Providers CRUD
         async function fetchDNSProviders() {
             try {
-                const response = await fetch('/api/v1/dns-providers');
+                const response = await apiFetch('/api/v1/dns-providers');
+                if (!response.ok) return;
                 const providers = await response.json();
                 renderDNSProviders(providers);
             } catch (error) {
@@ -371,7 +412,6 @@ Copy the appropriate command above to install your agent!`;
         }
 
         function renderDNSProviders(providers) {
-            // Render DNS providers UI
             console.log('DNS Providers:', providers);
         }
 
@@ -382,9 +422,8 @@ Copy the appropriate command above to install your agent!`;
             
             const tags = tagsInput.split(',').map(t => t.trim()).filter(t => t.length > 0);
             
-            fetch(`/api/v1/nodes/${nodeId}/tags`, {
+            apiFetch(`/api/v1/nodes/${nodeId}/tags`, {
                 method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tags })
             }).then(res => res.json()).then(data => {
                 fetchNodes();
@@ -395,9 +434,8 @@ Copy the appropriate command above to install your agent!`;
 
         // Keepalive config
         function toggleKeepalive(nodeId, enabled) {
-            fetch(`/api/v1/nodes/${nodeId}/keepalive`, {
+            apiFetch(`/api/v1/nodes/${nodeId}/keepalive`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ enabled })
             });
         }
