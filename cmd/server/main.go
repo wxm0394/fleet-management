@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -46,8 +46,15 @@ type ControlPlane struct {
 func generateRandomPassword(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+	_, err := rand.Read(b)
+	if err != nil {
+		for i := range b {
+			b[i] = charset[i%len(charset)]
+		}
+	} else {
+		for i := range b {
+			b[i] = charset[b[i]%byte(len(charset))]
+		}
 	}
 	return string(b)
 }
@@ -441,7 +448,7 @@ func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		issuer := acme.NewDefaultIssuer()
-		result, err := issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON)
+		result, err := issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON, req.ACMEEnv)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return

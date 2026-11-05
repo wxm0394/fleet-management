@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v4/certificate"
@@ -26,13 +27,18 @@ type IssueResult struct {
 }
 
 type Issuer interface {
-	IssueCertificate(domain string, providerType string, credentialsJSON string) (*IssueResult, error)
+	IssueCertificate(domain string, providerType string, credentialsJSON string, acmeEnv string) (*IssueResult, error)
 }
 
-type DefaultIssuer struct{}
+type DefaultIssuer struct {
+	mu           sync.Mutex
+	userAccounts map[string]*acmeUser
+}
 
 func NewDefaultIssuer() Issuer {
-	return &DefaultIssuer{}
+	return &DefaultIssuer{
+		userAccounts: make(map[string]*acmeUser),
+	}
 }
 
 type acmeUser struct {
@@ -53,34 +59,48 @@ func (u *acmeUser) GetPrivateKey() crypto.PrivateKey {
 	return u.key
 }
 
-func (i *DefaultIssuer) IssueCertificate(domain string, providerType string, credentialsJSON string) (*IssueResult, error) {
+func (i *DefaultIssuer) IssueCertificate(domain string, providerType string, credentialsJSON string, acmeEnv string) (*IssueResult, error) {
 	if providerType == "local_self_signed" || providerType == "mock" || providerType == "" {
 		return generateSelfSignedCert(domain)
 	}
 
-	// Parse JSON credentials and set as env vars for lego provider
+	// Protect env var modification and provider challenge setup from concurrent race condition
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	// Parse JSON credentials and set as env vars for lego provider with deferred cleanup
 	if credentialsJSON != "" {
 		var creds map[string]string
 		if err := json.Unmarshal([]byte(credentialsJSON), &creds); err == nil {
 			for k, v := range creds {
 				os.Setenv(k, v)
+				defer os.Unsetenv(k)
 			}
 		}
 	}
 
-	// Create private key for ACME user
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate private key: %w", err)
+	caDirURL := lego.LEDirectoryProduction
+	if acmeEnv == "staging" {
+		caDirURL = lego.LEDirectoryStaging
 	}
 
-	user := &acmeUser{
-		Email: "admin@" + domain,
-		key:   privateKey,
+	userKey := caDirURL
+	user, exists := i.userAccounts[userKey]
+	if !exists {
+		// Create private key for ACME user
+		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate private key: %w", err)
+		}
+
+		user = &acmeUser{
+			Email: "admin@" + domain,
+			key:   privateKey,
+		}
 	}
 
 	config := lego.NewConfig(user)
-	config.CADirURL = lego.LEDirectoryProduction
+	config.CADirURL = caDirURL
 	config.Certificate.KeyType = "p256"
 
 	client, err := lego.NewClient(config)
@@ -97,11 +117,14 @@ func (i *DefaultIssuer) IssueCertificate(domain string, providerType string, cre
 		return nil, fmt.Errorf("failed to set DNS01 provider: %w", err)
 	}
 
-	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-	if err != nil {
-		return nil, fmt.Errorf("ACME registration failed: %w", err)
+	if user.Registration == nil {
+		reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+		if err != nil {
+			return nil, fmt.Errorf("ACME registration failed: %w", err)
+		}
+		user.Registration = reg
+		i.userAccounts[userKey] = user
 	}
-	user.Registration = reg
 
 	request := certificate.ObtainRequest{
 		Domains: []string{domain},
