@@ -5,9 +5,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"embed"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"fleet-panel/internal/acme"
@@ -53,8 +54,8 @@ func generateRandomPassword(length int) string {
 
 func adminAuthMiddleware(adminPassword string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Public agent endpoints do not require admin auth
-		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/") {
+		// Public agent endpoints and install script do not require admin auth
+		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/") || r.URL.Path == "/install.sh" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -129,6 +130,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(subFS)))
+	mux.HandleFunc("GET /install.sh", cp.handleInstallScript)
 	mux.HandleFunc("POST /api/v1/agent/register", cp.handleRegister)
 	mux.HandleFunc("GET /api/v1/agent/tunnel", cp.handleTunnel)
 	mux.HandleFunc("POST /api/v1/tokens", cp.handleCreateToken)
@@ -146,6 +148,99 @@ func main() {
 
 	handler := adminAuthMiddleware(*adminPass, mux)
 	log.Fatal(http.ListenAndServe(*addr, handler))
+}
+
+func (cp *ControlPlane) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Missing token parameter", http.StatusBadRequest)
+		return
+	}
+
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	serverURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+
+	scriptTmpl := `#!/bin/sh
+set -e
+
+echo "[+] Installing Fleet Agent..."
+
+ARCH=$(uname -m)
+
+case "$ARCH" in
+    x86_64|amd64)
+        AGENT_ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        AGENT_ARCH="arm64"
+        ;;
+    *)
+        echo "[-] Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+DOWNLOAD_URL="https://github.com/wxm0394/fleet-management/releases/latest/download/fleet-agent-linux-${AGENT_ARCH}"
+
+echo "[+] Downloading fleet-agent (${AGENT_ARCH}) from ${DOWNLOAD_URL}..."
+curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/fleet-agent
+chmod +x /usr/local/bin/fleet-agent
+
+mkdir -p /etc/systemd/system
+
+cat <<EOF > /etc/systemd/system/fleet-agent.service
+[Unit]
+Description=Fleet Management Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fleet-agent -server {{.ServerURL}} -bootstrap {{.Token}}
+Restart=always
+RestartSec=5
+WorkDir=/var/lib/fleet-agent
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p /var/lib/fleet-agent
+
+echo "[+] Enabling and starting fleet-agent service..."
+systemctl daemon-reload
+systemctl enable --now fleet-agent
+
+echo "[+] Fleet Agent installation complete!"
+`
+
+	tmpl, err := template.New("install").Parse(scriptTmpl)
+	if err != nil {
+		http.Error(w, "Failed to generate script", http.StatusInternalServerError)
+		return
+	}
+
+	data := map[string]string{
+		"ServerURL": serverURL,
+		"Token":     token,
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		http.Error(w, "Failed to generate script", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="install.sh"`)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (cp *ControlPlane) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -290,8 +385,6 @@ func (cp *ControlPlane) handleNodePTY(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// DNS Providers CRUD
-
 func (cp *ControlPlane) handleDNSProviders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -322,8 +415,6 @@ func (cp *ControlPlane) handleDNSProviders(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// Certificates CRUD
-
 func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -344,13 +435,11 @@ func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Reques
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		// Fetch DNS provider credentials from database
 		dnsProvider, err := cp.store.GetDNSProvider(req.DNSProviderID)
 		if err != nil {
 			http.Error(w, "DNS provider not found", 404)
 			return
 		}
-		// Use acme issuer to generate cert/key in memory
 		issuer := acme.NewDefaultIssuer()
 		result, err := issuer.IssueCertificate(req.Domain, dnsProvider.ProviderType, dnsProvider.CredentialsJSON)
 		if err != nil {
@@ -366,8 +455,6 @@ func (cp *ControlPlane) handleCertificates(w http.ResponseWriter, r *http.Reques
 		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
 	}
 }
-
-// Proxy Routes CRUD
 
 func (cp *ControlPlane) handleProxyRoutes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -390,19 +477,14 @@ func (cp *ControlPlane) handleProxyRoutes(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		// Create route
 		routeID, err := cp.store.CreateProxyRoute(req.NodeID, req.Domain, req.Upstream, &req.CertID)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		// Sync to Agent via yamux tunnel
-		// Find the node session and POST /rpc/caddy/sync
 		if s, ok := cp.sessions.Load(req.NodeID); ok {
 			session := s.(*yamux.Session)
-			// Build sync payload from stored cert
 			cert, _ := cp.store.GetCertificate(req.CertID)
-			// Get routes for this node
 			routes, _ := cp.store.ListProxyRoutes()
 			var routeRules []protocol.RouteRule
 			for _, r := range routes {
@@ -414,7 +496,6 @@ func (cp *ControlPlane) handleProxyRoutes(w http.ResponseWriter, r *http.Request
 					})
 				}
 			}
-			// Get cert pair
 			var certs []protocol.CertPair
 			if cert != nil {
 				certs = []protocol.CertPair{
@@ -427,7 +508,6 @@ func (cp *ControlPlane) handleProxyRoutes(w http.ResponseWriter, r *http.Request
 				DryRun:       false,
 			}
 			payloadJSON, _ := json.Marshal(payload)
-			// Use session to open HTTP connection to agent
 			client := &http.Client{
 				Timeout: 5 * time.Second,
 				Transport: &http.Transport{

@@ -1,0 +1,79 @@
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build Binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o dist/fleet-server-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/server
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o dist/fleet-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/agent
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Organize Release Files
+        run: |
+          mkdir -p release-files
+          find release-artifacts -type f -exec cp {} release-files/ \;
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

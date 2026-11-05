@@ -1,6 +1,5 @@
 <!DOCTYPE html>
 <html lang="en" class="dark">
-<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Fleet Management Dashboard</title>
@@ -25,14 +24,14 @@
         </div>
         
         <!-- Tab Navigation -->
-        <div class="flex border-b border-gray-700 mb-4">
-            <button id="tab-nodes" class="tab-btn active border-b-2 border-blue-600 text-blue-400">Nodes</button>
-            <button id="tab-dns" class="tab-btn border-b-2 border-transparent text-gray-400">DNS & ACME</button>
-            <button id="tab-routes" class="tab-btn border-b-2 border-transparent text-gray-400">Proxy Routes</button>
-            <button id="tab-stacks" class="tab-btn border-b-2 border-transparent text-gray-400">Docker Compose</button>
+        <div class="flex border-b border-gray-700 mb-4 gap-6 px-2 pb-1">
+            <button id="tab-nodes" class="tab-btn active border-b-2 border-blue-600 text-blue-400 font-medium pb-2 px-1">Nodes</button>
+            <button id="tab-dns" class="tab-btn border-b-2 border-transparent text-gray-400 hover:text-gray-200 font-medium pb-2 px-1">DNS & ACME</button>
+            <button id="tab-routes" class="tab-btn border-b-2 border-transparent text-gray-400 hover:text-gray-200 font-medium pb-2 px-1">Proxy Routes</button>
+            <button id="tab-stacks" class="tab-btn border-b-2 border-transparent text-gray-400 hover:text-gray-200 font-medium pb-2 px-1">Docker Compose</button>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="nodes-container"></div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 py-2" id="nodes-container"></div>
     </div>
 
     <!-- Terminal Modal -->
@@ -170,6 +169,25 @@
 
         // Node card template - fixed layout with proper metrics
         const nodeTemplate = (node) => {
+            // Safely handle tags - node.tags could be string from JSON, array, or undefined
+            let tagsHTML = '';
+            if (node.tags && Array.isArray(node.tags) && node.tags.length > 0) {
+                tagsHTML = node.tags.map(t => `<span class="text-xxs bg-gray-600 rounded px-1 py-0.5">${t}</span>`).join('');
+            } else if (typeof node.tags === 'string' && node.tags.length > 0) {
+                // Parse JSON string tags
+                try {
+                    const parsedTags = JSON.parse(node.tags);
+                    if (Array.isArray(parsedTags) && parsedTags.length > 0) {
+                        tagsHTML = parsedTags.map(t => `<span class="text-xxs bg-gray-600 rounded px-1 py-0.5">${t}</span>`).join('');
+                    }
+                } catch(e) {
+                    // If parsing fails, show as plain string
+                    tagsHTML = `<span class="text-xxs bg-gray-600 rounded px-1 py-0.5">${node.tags}</span>`;
+                }
+            } else {
+                tagsHTML = '<span class="text-gray-500">none</span>';
+            }
+            
             const statusColor = node.online ? 'bg-green-500' : 'bg-red-500';
             const cpuColor = node.online ? 'bg-blue-600' : 'bg-gray-500';
             const memColor = node.online ? 'bg-green-600' : 'bg-gray-500';
@@ -191,28 +209,28 @@
                     <div class="mb-3">
                         <div class="text-xs text-gray-400 mb-1">CPU</div>
                         <div class="w-full bg-gray-700 rounded-full h-2">
-                            <div class="bg-blue-600 h-2 rounded-full transition-width" style="width: ${Math.min(node.cpuPercent, 100)}%"></div>
+                            <div class="bg-blue-600 h-2 rounded-full transition-width" style="width: ${Math.min(node.cpuPercent ?? 0, 100)}%"></div>
                         </div>
-                        <span class="text-xs text-gray-300 metric-value">${node.cpuPercent.toFixed(1)}%</span>
+                        <span class="text-xs text-gray-300 metric-value">${(node.cpuPercent ?? 0).toFixed(1)}%</span>
                     </div>
                     <div class="mb-3">
                         <div class="text-xs text-gray-400 mb-1">Mem</div>
                         <div class="w-full bg-gray-700 rounded-full h-2">
-                            <div class="bg-green-600 h-2 rounded-full transition-width" style="width: ${Math.min(node.memPercent, 100)}%"></div>
+                            <div class="bg-green-600 h-2 rounded-full transition-width" style="width: ${Math.min(node.memPercent ?? 0, 100)}%"></div>
                         </div>
-                        <span class="text-xs text-gray-300 metric-value">${node.memUsedMB}MB / ${node.memTotalMB}MB</span>
+                        <span class="text-xs text-gray-300 metric-value">${(node.memUsedMB ?? 0)}MB / ${(node.memTotalMB ?? 0)}MB</span>
                     </div>
                     <div class="mb-3">
                         <div class="text-xs text-gray-400 mb-1">Disk</div>
                         <div class="w-full bg-gray-700 rounded-full h-2">
-                            <div class="bg-yellow-600 h-2 rounded-full transition-width" style="width: ${Math.min((node.diskUsedGB / node.diskTotalGB) * 100, 100)}%"></div>
+                            <div class="bg-yellow-600 h-2 rounded-full transition-width" style="width: ${Math.min((node.diskUsedGB ?? 0) / (node.diskTotalGB ?? 1) * 100, 100)}%"></div>
                         </div>
-                        <span class="text-xs text-gray-300 metric-value">${node.diskUsedGB}GB / ${node.diskTotalGB}GB</span>
+                        <span class="text-xs text-gray-300 metric-value">${node.diskUsedGB ?? 0}GB / ${node.diskTotalGB ?? 1}GB</span>
                     </div>
                     <div class="mb-3">
                         <div class="text-xs text-gray-400 mb-1">Tags</div>
                         <div class="flex flex-wrap gap-1">
-                            ${node.tags && node.tags.length > 0 ? node.tags.map(t => `<span class="text-xxs bg-gray-600 rounded px-1 py-0.5">${t}</span>`).join('') : '<span class="text-gray-500">none</span>'}
+                            ${tagsHTML}
                         </div>
                     </div>
                     <button class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-1 px-3 rounded text-sm w-full" onclick="openTerminal('${node.id}')">>_ WebSSH Terminal</button>
@@ -230,14 +248,20 @@
 
                 for (const node of nodes) {
                     if (node.online) {
-                        const metricsResponse = await fetch(`/api/v1/nodes/${node.id}/metrics`);
-                        const metrics = await metricsResponse.json();
-                        node.cpuPercent = metrics.cpuPercent;
-                        node.memPercent = metrics.memPercent;
-                        node.diskUsedGB = metrics.diskUsedGB;
-                        node.diskTotalGB = metrics.diskTotalGB;
-                        node.memUsedMB = metrics.memUsedMB;
-                        node.memTotalMB = metrics.memTotalMB;
+                        try {
+                            const metricsResponse = await fetch(`/api/v1/nodes/${node.id}/metrics`);
+                            if (metricsResponse.ok) {
+                                const metrics = await metricsResponse.json();
+                                node.cpuPercent = metrics.cpuPercent ?? node.cpuPercent;
+                                node.memPercent = metrics.memPercent ?? node.memPercent;
+                                node.diskUsedGB = metrics.diskUsedGB ?? node.diskUsedGB;
+                                node.diskTotalGB = metrics.diskTotalGB ?? node.diskTotalGB;
+                                node.memUsedMB = metrics.memUsedMB ?? node.memUsedMB;
+                                node.memTotalMB = metrics.memTotalMB ?? node.memTotalMB;
+                            }
+                        } catch (e) {
+                            console.warn('Failed to fetch metrics for node:', node.id, e);
+                        }
                     }
                     nodesContainer.innerHTML += nodeTemplate(node);
                 }
@@ -251,8 +275,31 @@
             try {
                 const response = await fetch('/api/v1/tokens', { method: 'POST' });
                 const data = await response.json();
-                const command = `go run ./cmd/agent -server http://127.0.0.1:8080 -bootstrap ${data.bootstrap_token}`;
-                alert(`New node command:\n\n${command}`);
+                const token = data.bootstrap_token;
+                
+                // Get current host and protocol
+                const protocol = window.location.protocol;
+                const host = window.location.host;
+                const serverURL = `${protocol}//${host}`;
+                
+                // Production one-line install command
+                const installCommand = `curl -fsSL ${serverURL}/install.sh?token=${token} | sudo sh`;
+                
+                // Local debug command
+                const debugCommand = `go run ./cmd/agent -server ${serverURL} -bootstrap ${token}`;
+                
+                // Show both commands in a nice modal
+                const message = `🚀 Fleet Agent Installation Commands
+
+📦 Production Installation (One-line):
+${installCommand}
+
+🔧 Local Development:
+${debugCommand}
+
+Copy the appropriate command above to install your agent!`;
+                
+                alert(message);
             } catch (error) {
                 console.error('Error generating token:', error);
             }
