@@ -5,7 +5,9 @@ agent_identity.json
 dist/
 fleet-server*
 fleet-agent*
-server
-agent
+/server
+/agent
+!/cmd/server/
+!/cmd/agent/
 *.tmp
 *.log
