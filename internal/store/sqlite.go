@@ -254,9 +254,14 @@ func (s *Store) CreateDNSProvider(name, providerType, credentialsJSON string) (s
 		return "", err
 	}
 	now := time.Now().Unix()
+	// Encrypt credentials before storing
+	encryptedCreds, err := EncryptCredentials(credentialsJSON)
+	if err != nil {
+		return "", err
+	}
 	_, err = s.db.Exec(
 		`INSERT INTO dns_providers (id, name, provider_type, credentials_json, created_at) VALUES (?, ?, ?, ?, ?)`,
-		id.String(), name, providerType, credentialsJSON, now,
+		id.String(), name, providerType, encryptedCreds, now,
 	)
 	if err != nil {
 		return "", err
@@ -270,6 +275,10 @@ func (s *Store) GetDNSProvider(id string) (*DNSProviderRecord, error) {
 	err := row.Scan(&r.ID, &r.Name, &r.ProviderType, &r.CredentialsJSON, &r.CreatedAt)
 	if err != nil {
 		return nil, err
+	}
+	decryptedCreds, err := DecryptCredentials(r.CredentialsJSON)
+	if err == nil {
+		r.CredentialsJSON = decryptedCreds
 	}
 	return &r, nil
 }
@@ -287,15 +296,23 @@ func (s *Store) ListDNSProviders() ([]DNSProviderRecord, error) {
 		if err := rows.Scan(&r.ID, &r.Name, &r.ProviderType, &r.CredentialsJSON, &r.CreatedAt); err != nil {
 			return nil, err
 		}
+		decryptedCreds, err := DecryptCredentials(r.CredentialsJSON)
+		if err == nil {
+			r.CredentialsJSON = decryptedCreds
+		}
 		list = append(list, r)
 	}
 	return list, nil
 }
 
 func (s *Store) UpdateDNSProvider(id, name, providerType, credentialsJSON string) error {
-	_, err := s.db.Exec(
+	encryptedCreds, err := EncryptCredentials(credentialsJSON)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
 		`UPDATE dns_providers SET name = ?, provider_type = ?, credentials_json = ? WHERE id = ?`,
-		name, providerType, credentialsJSON, id,
+		name, providerType, encryptedCreds, id,
 	)
 	return err
 }

@@ -37,8 +37,14 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o fleet-agent .
 启动控制面服务：
 
 ```bash
-./fleet-server -listen :8080 -db fleet.db -admin-pass admin123
+# Using environment variable for admin password (recommended for production)
+FLEET_ADMIN_PASS=your-secure-password ./fleet-server -listen :8080 -db fleet.db
+
+# Or let the server auto-generate a random password (development only)
+./fleet-server -listen :8080 -db fleet.db
 ```
+
+The `-admin-pass` CLI flag has been removed to prevent password exposure in process listings (`ps aux`). The admin password is read from the `FLEET_ADMIN_PASS` environment variable. If not set, a random 16-character password is auto-generated at startup (displayed in logs).
 
 启动后访问 `http://<server-ip>:8080` 进入控制面板，使用启动时设置的密码登录。
 
@@ -57,6 +63,35 @@ curl -fsSL http://<server-ip>:8080/install.sh?token=<your-token> | sudo sh
 ```bash
 go run ./cmd/agent -server http://localhost:8080 -bootstrap <your-token>
 ```
+
+---
+
+## 安全加固与最佳实践 (Security Hardening)
+
+### 1. Control Plane TLS 配置
+生产环境中强烈建议为控制面启用 TLS (HTTPS)。
+
+- **原生 HTTPS 支持**：
+  ```bash
+  ./fleet-server -listen :8443 -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem
+  ```
+  或者通过环境变量配置：`FLEET_TLS_CERT` 和 `FLEET_TLS_KEY`。
+
+- **反向代理 TLS 终止（推荐）**：
+  在控制面前部署 Caddy 或 Nginx 进行 TLS 终止。使用反向代理时，控制面服务应仅绑定至本地回环接口：
+  ```bash
+  ./fleet-server -listen 127.0.0.1:8080 -db fleet.db
+  ```
+
+### 2. Admin 密码与防暴力破解 (Brute-Force Protection)
+- **密码敏感信息隔离**：移除了 `-admin-pass` 命令行 Flag，避免密码通过进程列表 (`ps aux` / `/proc/cmdline`) 泄露。密码通过 `FLEET_ADMIN_PASS` 环境变量读取；若未设置，控制面启动时会自动生成随机 16 位强密码并在控制台日志中提醒。
+- **IP 封禁机制**：当同一个 IP 在 15 分钟内连续鉴权失败 5 次，系统将自动封禁该 IP 15 分钟，在此期间所有带鉴权的请求直接返回 `HTTP 429 Too Many Requests` 以及 `Retry-After` 响应头（秒）。成功登录会自动重置该 IP 的失败记录。系统后台协程会定期清理超过 1 小时未活动的 IP 记录。
+
+### 3. DNS Provider 凭据 AES-256-GCM 加密
+数据库中的 DNS Provider 敏感凭据 (JSON) 使用 AES-256-GCM 算法进行存储加密。
+- 主密钥通过环境变量 `FLEET_ENCRYPTION_KEY` 提供（支持 64 位 Hex 字符、Base64 字符串或 32 字节原始密钥）。
+- 若未显式配置 `FLEET_ENCRYPTION_KEY`，控制面在启动时会自动生成随机 32 字节密钥并显示警告输出，请务必妥善保存该密钥以便重启后解密历史记录。
+- 系统具备平滑兼容能力，解密时若遇到历史未加密的明文记录会自动无缝兼容回退。
 
 ---
 
