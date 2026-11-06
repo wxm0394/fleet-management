@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -71,7 +72,30 @@ func generateRandomPassword(length int) string {
 	return string(b)
 }
 
-func adminAuthMiddleware(cp *ControlPlane, adminPassword string, next http.Handler) http.Handler {
+func (cp *ControlPlane) extractClientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			firstIP := strings.TrimSpace(parts[0])
+			if net.ParseIP(firstIP) != nil {
+				return firstIP
+			}
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			ipStr := strings.TrimSpace(xri)
+			if net.ParseIP(ipStr) != nil {
+				return ipStr
+			}
+		}
+	}
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || clientIP == "" {
+		return r.RemoteAddr
+	}
+	return clientIP
+}
+
+func adminAuthMiddleware(cp *ControlPlane, adminPassword string, trustProxy bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Public agent endpoints and install script do not require admin auth
 		if strings.HasPrefix(r.URL.Path, "/api/v1/agent/") || r.URL.Path == "/install.sh" {
@@ -85,10 +109,7 @@ func adminAuthMiddleware(cp *ControlPlane, adminPassword string, next http.Handl
 			return
 		}
 
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil || clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
+		clientIP := cp.extractClientIP(r, trustProxy)
 
 		// Check IP-based rate limiting / lockout
 		if locked, retryAfter := cp.checkAuthLockout(clientIP); locked {
@@ -206,7 +227,15 @@ func main() {
 	dbPath := flag.String("db", "fleet.db", "sqlite path")
 	tlsCert := flag.String("tls-cert", os.Getenv("FLEET_TLS_CERT"), "TLS certificate file path")
 	tlsKey := flag.String("tls-key", os.Getenv("FLEET_TLS_KEY"), "TLS key file path")
+	trustProxyFlag := flag.Bool("trust-proxy-headers", false, "trust X-Forwarded-For and X-Real-IP headers from reverse proxy (default false)")
 	flag.Parse()
+
+	trustProxy := *trustProxyFlag
+	if envVal := os.Getenv("FLEET_TRUST_PROXY_HEADERS"); envVal != "" {
+		if b, err := strconv.ParseBool(envVal); err == nil {
+			trustProxy = b
+		}
+	}
 
 	// Admin password: only from environment variable, no command-line flag
 	adminPass := os.Getenv("FLEET_ADMIN_PASS")
@@ -288,7 +317,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/stacks", cp.handleCreateStack)
 	mux.HandleFunc("POST /api/v1/nodes/{id}/keepalive", cp.handleNodeKeepalive)
 
-	handler := adminAuthMiddleware(cp, adminPass, mux)
+	handler := adminAuthMiddleware(cp, adminPass, trustProxy, mux)
 
 	// Start HTTP server in goroutine
 	go func() {

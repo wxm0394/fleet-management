@@ -86,6 +86,47 @@ go run ./cmd/agent -server http://localhost:8080 -bootstrap <your-token>
 ### 2. Admin 密码与防暴力破解 (Brute-Force Protection)
 - **密码敏感信息隔离**：移除了 `-admin-pass` 命令行 Flag，避免密码通过进程列表 (`ps aux` / `/proc/cmdline`) 泄露。密码通过 `FLEET_ADMIN_PASS` 环境变量读取；若未设置，控制面启动时会自动生成随机 16 位强密码并在控制台日志中提醒。
 - **IP 封禁机制**：当同一个 IP 在 15 分钟内连续鉴权失败 5 次，系统将自动封禁该 IP 15 分钟，在此期间所有带鉴权的请求直接返回 `HTTP 429 Too Many Requests` 以及 `Retry-After` 响应头（秒）。成功登录会自动重置该 IP 的失败记录。系统后台协程会定期清理超过 1 小时未活动的 IP 记录。
+- **反向代理与真实 IP 信任配置 (`-trust-proxy-headers` / `FLEET_TRUST_PROXY_HEADERS`)**：
+  当控制面部署在 Caddy/Nginx 等反向代理之后时，由于所有请求的直连 `RemoteAddr` 均为 `127.0.0.1`，直接基于 `RemoteAddr` 进行 IP 封禁会导致单个攻击者的失败尝试误封整个本地反向代理，影响正常管理员访问。
+  - 启动控制面时添加 `-trust-proxy-headers` 命令行标志或设置环境变量 `FLEET_TRUST_PROXY_HEADERS=true`（默认值为 `false`）。
+  - 开启后，控制面将优先解析 `X-Forwarded-For`（最左侧首个有效 IP）及 `X-Real-IP` 请求头作为客户端真实 IP，并对 IP 格式合法性进行严格校验。
+  - **⚠️ 极高安全风险警告**：仅在控制面服务**严格绑定在 `127.0.0.1`** 且仅允许本地反向代理接入时方可启用该参数！若控制面公网端口直接暴露并开启了该参数，攻击者可通过伪造 `X-Forwarded-For` / `X-Real-IP` 请求头轻松绕过 IP 锁定防护。
+
+#### 反向代理配置示例
+
+**Caddyfile 示例**：
+```caddy
+fleet.example.com {
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+**Nginx 示例**：
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name fleet.example.com;
+
+    ssl_certificate /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 支持 (节点 Tunnel / PTY)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+```
 
 ### 3. DNS Provider 凭据 AES-256-GCM 加密
 数据库中的 DNS Provider 敏感凭据 (JSON) 使用 AES-256-GCM 算法进行存储加密。
