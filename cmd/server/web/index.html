@@ -312,36 +312,96 @@
         // Generate new node token
         document.getElementById('generate-token').addEventListener('click', async () => {
             try {
+                // Resolve the real Agent endpoint first. Do not mint a token if this fails.
+                const infoResponse = await apiFetch('/api/v1/server-info');
+                if (!infoResponse.ok) throw new Error(`Server configuration request failed (HTTP ${infoResponse.status}). Check the admin password and try again.`);
+                const info = await infoResponse.json();
+                const serverURL = info.server_url;
+                if (!serverURL) throw new Error('The Fleet Agent server URL is not configured.');
+
                 const response = await apiFetch('/api/v1/tokens', { method: 'POST' });
-                if (!response.ok) return;
+                if (!response.ok) throw new Error(`Token creation failed (HTTP ${response.status}): ${await response.text()}`);
                 const data = await response.json();
                 const token = data.bootstrap_token;
+                if (!token) throw new Error('The server response did not contain a bootstrap token.');
                 
-                // Get current host and protocol
-                const protocol = window.location.protocol;
-                const host = window.location.host;
-                const serverURL = `${protocol}//${host}`;
-                
-                // Production one-line install command
-                const installCommand = `curl -fsSL ${serverURL}/install.sh?token=${token} | sudo sh`;
-                
-                // Local debug command
-                const debugCommand = `go run ./cmd/agent -server ${serverURL} -bootstrap ${token}`;
-                
-                // Show both commands in a nice modal
-                const message = `🚀 Fleet Agent Installation Commands
+                const installCommand = `curl -fsSL "${serverURL}/install.sh?token=${encodeURIComponent(token)}" | sudo sh`;
+                const debugCommand = `go run ./cmd/agent -server "${serverURL}" -bootstrap "${token}"`;
 
-📦 Production Installation (One-line):
-${installCommand}
-
-🔧 Local Development:
-${debugCommand}
-
-Copy the appropriate command above to install your agent!`;
-                
-                alert(message);
+                // Replace the old browser alert with a usable installation dialog.
+                document.getElementById('fleet-install-dialog')?.remove();
+                const dialog = document.createElement('div');
+                dialog.id = 'fleet-install-dialog';
+                dialog.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4';
+                dialog.innerHTML = `
+                  <section role="dialog" aria-modal="true" aria-labelledby="fleet-install-title"
+                    class="w-full max-w-2xl rounded-2xl border border-gray-700 bg-gray-900 p-6 shadow-2xl">
+                    <div class="mb-5 flex items-start justify-between gap-4">
+                      <div>
+                        <div class="mb-2 inline-flex items-center rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">NODE TOKEN CREATED</div>
+                        <h2 id="fleet-install-title" class="text-2xl font-bold text-white">Install a Fleet Agent</h2>
+                        <p class="mt-1 text-sm text-gray-400">Run this command on the Linux machine you want to manage.</p>
+                      </div>
+                      <button id="fleet-install-close" aria-label="Close" class="rounded-lg px-3 py-1 text-2xl text-gray-400 hover:bg-gray-800 hover:text-white">&times;</button>
+                    </div>
+                    <div class="mb-4 rounded-xl border border-gray-700 bg-gray-800/70 p-4">
+                      <div class="mb-2 flex items-center justify-between gap-3">
+                        <h3 class="font-semibold text-white">Production installation</h3>
+                        <button id="fleet-copy-install" class="rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-500">Copy command</button>
+                      </div>
+                      <pre class="overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-gray-950 p-3 text-sm leading-6 text-emerald-300"><code id="fleet-install-command"></code></pre>
+                      <p class="mt-2 text-xs text-gray-400">Requires Linux, curl, sudo, and Tailscale connectivity to this Fleet server.</p>
+                    </div>
+                    <details class="mb-4 rounded-xl border border-gray-700 p-4">
+                      <summary class="cursor-pointer text-sm font-semibold text-gray-300">Local development command</summary>
+                      <pre class="mt-3 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-gray-950 p-3 text-sm text-gray-300"><code id="fleet-debug-command"></code></pre>
+                      <button id="fleet-copy-debug" class="mt-2 rounded-lg border border-gray-600 px-3 py-2 text-sm text-gray-200 hover:bg-gray-800">Copy development command</button>
+                    </details>
+                    <div class="flex flex-wrap items-center justify-between gap-3 border-t border-gray-800 pt-4">
+                      <p class="max-w-md text-xs text-amber-300">This one-time token expires in 1 hour. Keep it private.</p>
+                      <button id="fleet-install-done" class="rounded-lg bg-gray-700 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-600">Done</button>
+                    </div>
+                    <p id="fleet-copy-status" role="status" class="mt-3 min-h-5 text-right text-xs text-emerald-300"></p>
+                  </section>`;
+                document.body.appendChild(dialog);
+                document.getElementById('fleet-install-command').textContent = installCommand;
+                document.getElementById('fleet-debug-command').textContent = debugCommand;
+                const closeDialog = () => dialog.remove();
+                document.getElementById('fleet-install-close').addEventListener('click', closeDialog);
+                document.getElementById('fleet-install-done').addEventListener('click', closeDialog);
+                dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
+                const copyCommand = async command => {
+                    try {
+                        await navigator.clipboard.writeText(command);
+                        document.getElementById('fleet-copy-status').textContent = 'Copied to clipboard.';
+                    } catch (error) {
+                        document.getElementById('fleet-copy-status').textContent = 'Clipboard unavailable. Select and copy the command manually.';
+                    }
+                };
+                document.getElementById('fleet-copy-install').addEventListener('click', () => copyCommand(installCommand));
+                document.getElementById('fleet-copy-debug').addEventListener('click', () => copyCommand(debugCommand));
             } catch (error) {
                 console.error('Error generating token:', error);
+                document.getElementById('fleet-error-dialog')?.remove();
+                const failure = document.createElement('div');
+                failure.id = 'fleet-error-dialog';
+                failure.className = 'fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4';
+                failure.innerHTML = `
+                  <section role="alertdialog" aria-modal="true" aria-labelledby="fleet-error-title"
+                    class="w-full max-w-lg rounded-2xl border border-red-500/40 bg-gray-900 p-6 shadow-2xl">
+                    <div class="mb-3 flex items-center gap-3">
+                      <span class="flex h-10 w-10 items-center justify-center rounded-full bg-red-500/10 text-xl text-red-300">!</span>
+                      <h2 id="fleet-error-title" class="text-xl font-bold text-white">Could not create node token</h2>
+                    </div>
+                    <p class="text-sm leading-6 text-gray-300" id="fleet-error-message"></p>
+                    <div class="mt-5 flex justify-end">
+                      <button id="fleet-error-close" class="rounded-lg bg-gray-700 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-600">Close</button>
+                    </div>
+                  </section>`;
+                document.body.appendChild(failure);
+                document.getElementById('fleet-error-message').textContent = error.message || 'An unexpected error occurred.';
+                document.getElementById('fleet-error-close').addEventListener('click', () => failure.remove());
+                failure.addEventListener('click', event => { if (event.target === failure) failure.remove(); });
             }
         });
 

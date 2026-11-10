@@ -37,6 +37,8 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
+var configuredServerURL string
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -228,8 +230,11 @@ func main() {
 	tlsCert := flag.String("tls-cert", os.Getenv("FLEET_TLS_CERT"), "TLS certificate file path")
 	tlsKey := flag.String("tls-key", os.Getenv("FLEET_TLS_KEY"), "TLS key file path")
 	trustProxyFlag := flag.Bool("trust-proxy-headers", false, "trust X-Forwarded-For and X-Real-IP headers from reverse proxy (default false)")
+	agentAMD64 := flag.String("agent-amd64", "/opt/fleet-management/fleet-agent-linux-amd64", "Linux amd64 Agent binary path")
+	agentARM64 := flag.String("agent-arm64", "/opt/fleet-management/fleet-agent-linux-arm64", "Linux arm64 Agent binary path")
 	flag.Parse()
 
+	configuredServerURL = strings.TrimRight(strings.TrimSpace(os.Getenv("FLEET_SERVER_URL")), "/")
 	trustProxy := *trustProxyFlag
 	if envVal := os.Getenv("FLEET_TRUST_PROXY_HEADERS"); envVal != "" {
 		if b, err := strconv.ParseBool(envVal); err == nil {
@@ -301,7 +306,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(subFS)))
+	mux.HandleFunc("GET /fleet-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, *agentAMD64) })
+	mux.HandleFunc("GET /fleet-agent-linux-arm64", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, *agentARM64) })
 	mux.HandleFunc("GET /install.sh", cp.handleInstallScript)
+	mux.HandleFunc("GET /api/v1/server-info", cp.handleServerInfo)
 	mux.HandleFunc("POST /api/v1/agent/register", cp.handleRegister)
 	mux.HandleFunc("GET /api/v1/agent/tunnel", cp.handleTunnel)
 	mux.HandleFunc("POST /api/v1/tokens", cp.handleCreateToken)
@@ -335,6 +343,19 @@ func main() {
 	log.Println("[INFO] Shutting down Control Plane...")
 }
 
+func (cp *ControlPlane) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	serverURL := configuredServerURL
+	if serverURL == "" {
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		serverURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"server_url": serverURL})
+}
+
 func (cp *ControlPlane) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -351,7 +372,10 @@ func (cp *ControlPlane) handleInstallScript(w http.ResponseWriter, r *http.Reque
 	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
-	serverURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+	serverURL := configuredServerURL
+	if serverURL == "" {
+		serverURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
 
 	scriptTmpl := `#!/bin/sh
 set -e
@@ -373,7 +397,7 @@ case "$ARCH" in
         ;;
 esac
 
-DOWNLOAD_URL="https://github.com/wxm0394/fleet-management/releases/latest/download/fleet-agent-linux-${AGENT_ARCH}"
+DOWNLOAD_URL="{{.ServerURL}}/fleet-agent-linux-${AGENT_ARCH}"
 
 echo "[+] Downloading fleet-agent (${AGENT_ARCH}) from ${DOWNLOAD_URL}..."
 curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/fleet-agent
