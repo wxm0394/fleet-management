@@ -49,6 +49,8 @@ type ControlPlane struct {
 	renewingCerts sync.Map
 	sessions      sync.Map
 	authAttempts  sync.Map // key: client IP (string), value: *authAttempt
+	notionAPIKey  string
+	notionDBID    string
 }
 
 type authAttempt struct {
@@ -254,9 +256,20 @@ func main() {
 		log.Fatalf("sqlite err: %v", err)
 	}
 
+	notionAPIKey := os.Getenv("NOTION_API_KEY")
+	notionDBID := os.Getenv("NOTION_DATABASE_ID")
+	if notionDBID == "" {
+		notionDBID = "41918af3-0b67-8152-86a8-000b7b516d50"
+	}
+	if notionAPIKey == "" {
+		log.Println("[INFO] NOTION_API_KEY not set; /api/v1/resources/sync-notion will return 503 until it is configured.")
+	}
+
 	cp := &ControlPlane{
-		store:  db,
-		issuer: acme.NewDefaultIssuer(),
+		store:        db,
+		issuer:       acme.NewDefaultIssuer(),
+		notionAPIKey: notionAPIKey,
+		notionDBID:   notionDBID,
 	}
 	bootToken, err := db.CreateBootstrapToken(24 * time.Hour)
 	if err != nil {
@@ -493,6 +506,13 @@ func (cp *ControlPlane) handleNotionSync(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if cp.notionAPIKey == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "notion not configured: set NOTION_API_KEY"})
+		return
+	}
+
 	var req struct {
 		ResourceID   string `json:"resource_id"`
 		NotionPageID string `json:"notion_page_id"`
@@ -502,20 +522,254 @@ func (cp *ControlPlane) handleNotionSync(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Fetch the resource from the database
-	_, err := cp.store.GetFreeResource(req.ResourceID)
+	// Helper to sync a single resource
+	syncOne := func(res *store.FreeResourceRecord, pageID string) (string, string, error) {
+		// If pageID not provided, query by name
+		if pageID == "" {
+			foundID, err := cp.notionFindPageByName(res.Name)
+			if err != nil {
+				return "", "", err
+			}
+			pageID = foundID
+		}
+
+		props := cp.notionBuildProperties(res)
+		if pageID == "" {
+			// Create new page
+			newID, err := cp.notionCreatePage(props)
+			if err != nil {
+				return "", "", err
+			}
+			return newID, "created", nil
+		} else {
+			// Update existing page
+			err := cp.notionUpdatePage(pageID, props)
+			if err != nil {
+				return "", "", err
+			}
+			return pageID, "updated", nil
+		}
+	}
+
+	// Handle "all" or single resource
+	if req.ResourceID == "all" {
+		resources, err := cp.store.ListFreeResources(nil, nil)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		var synced, created, updated int
+		var failed []map[string]string
+
+		for _, res := range resources {
+			pageID := ""
+			if req.NotionPageID != "" {
+				// When syncing all with a specific pageID, only use it for the first match?
+				// Per spec, notion_page_id is optional and only used when syncing a single resource.
+				// For "all", we ignore it and query by name for each.
+				pageID = ""
+			}
+			id, action, err := syncOne(&res, pageID)
+			if err != nil {
+				failed = append(failed, map[string]string{"name": res.Name, "error": err.Error()})
+				continue
+			}
+			synced++
+			if action == "created" {
+				created++
+			} else {
+				updated++
+			}
+			_ = id // suppress unused warning
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "synced",
+			"synced":  synced,
+			"created": created,
+			"updated": updated,
+			"failed":  failed,
+		})
+		return
+	}
+
+	// Single resource
+	res, err := cp.store.GetFreeResource(req.ResourceID)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	// TODO: Implement Notion sync logic here
-	// For example, update the Notion page with the resource data
-	// Use Notion API client to make the request
-	// Handle errors and return appropriate responses
+	id, action, err := syncOne(res, req.NotionPageID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "notion api error: " + err.Error()})
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "notion sync endpoint ready - implementation pending"})
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":         "synced",
+		"notion_page_id": id,
+		"action":         action,
+	})
+}
+
+// Notion API helpers
+
+func (cp *ControlPlane) notionRequest(method, path string, body any) ([]byte, int, error) {
+	url := "https://api.notion.com/v1" + path
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cp.notionAPIKey)
+	req.Header.Set("Notion-Version", "2022-06-28")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, resp.StatusCode, fmt.Errorf("%d %s", resp.StatusCode, string(respBody))
+	}
+	return respBody, resp.StatusCode, nil
+}
+
+func (cp *ControlPlane) notionFindPageByName(name string) (string, error) {
+	filter := map[string]any{
+		"property": "名称",
+		"title": map[string]any{
+			"equals": name,
+		},
+	}
+	body := map[string]any{
+		"filter":    filter,
+		"page_size": 1,
+	}
+	respBody, _, err := cp.notionRequest("POST", "/databases/"+cp.notionDBID+"/query", body)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Results []struct {
+			ID string `json:"id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", err
+	}
+	if len(result.Results) == 0 {
+		return "", nil
+	}
+	return result.Results[0].ID, nil
+}
+
+func (cp *ControlPlane) notionCreatePage(props map[string]any) (string, error) {
+	// Try database_id parent first
+	body := map[string]any{
+		"parent": map[string]any{
+			"database_id": cp.notionDBID,
+		},
+		"properties": props,
+	}
+	respBody, statusCode, err := cp.notionRequest("POST", "/pages", body)
+	if err != nil {
+		// If the error indicates we need data_source_id parent, retry
+		if statusCode == 400 && strings.Contains(err.Error(), "data_source") {
+			body["parent"] = map[string]any{
+				"type":           "data_source_id",
+				"data_source_id": cp.notionDBID,
+			}
+			respBody, _, err = cp.notionRequest("POST", "/pages", body)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			return "", err
+		}
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", err
+	}
+	return result.ID, nil
+}
+
+func (cp *ControlPlane) notionUpdatePage(pageID string, props map[string]any) error {
+	body := map[string]any{
+		"properties": props,
+	}
+	_, _, err := cp.notionRequest("PATCH", "/pages/"+pageID, body)
+	return err
+}
+
+func (cp *ControlPlane) notionBuildProperties(res *store.FreeResourceRecord) map[string]any {
+	props := map[string]any{
+		"名称": map[string]any{
+			"title": []map[string]any{
+				{"text": map[string]any{"content": res.Name}},
+			},
+		},
+		"类别": map[string]any{
+			"select": map[string]any{"name": res.Category},
+		},
+		"状态": map[string]any{
+			"select": map[string]any{"name": res.Status},
+		},
+		"免费额度": map[string]any{
+			"rich_text": []map[string]any{
+				{"text": map[string]any{"content": res.Quota}},
+			},
+		},
+		"备注": map[string]any{
+			"rich_text": []map[string]any{
+				{"text": map[string]any{"content": res.Note}},
+			},
+		},
+	}
+
+	// ExpiresAt: 0 means no expiry -> null
+	if res.ExpiresAt > 0 {
+		t := time.Unix(res.ExpiresAt, 0).UTC()
+		props["到期日"] = map[string]any{
+			"date": map[string]any{
+				"start": t.Format("2006-01-02"),
+			},
+		}
+	} else {
+		props["到期日"] = map[string]any{
+			"date": nil,
+		}
+	}
+
+	// Link: only if non-empty
+	if res.Link != "" {
+		props["链接"] = map[string]any{
+			"url": res.Link,
+		}
+	}
+
+	return props
 }
 
 func (cp *ControlPlane) handleRegister(w http.ResponseWriter, r *http.Request) {
