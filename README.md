@@ -147,3 +147,59 @@ server {
 ## 许可证
 
 [MIT License](LICENSE)
+
+## Free Resources
+
+The fleet management panel includes a **Free Resources** API for managing free/low-cost cloud resources (GPU instances, storage, etc.).
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET    | `/api/v1/resources` | List all free resources (optional query: `category`, `status`) |
+| POST   | `/api/v1/resources` | Create a new free resource entry |
+
+### Docker Compose Usage
+
+1. Copy `.env.example` to `.env` and adjust values:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Start the service:
+   ```bash
+   docker compose up -d
+   ```
+
+3. Access the API at `http://localhost:8080/api/v1/resources`
+
+4. Stop the service:
+   ```bash
+   docker compose down
+   ```
+
+### API Examples
+
+**List all resources:**
+```bash
+curl http://localhost:8080/api/v1/resources
+```
+
+**Filter by category:**
+```bash
+curl "http://localhost:8080/api/v1/resources?category=GPU"
+```
+
+**Create a new resource:**
+```bash
+curl -X POST http://localhost:8080/api/v1/resources \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Free GPU Cloud",
+    "category": "GPU",
+    "status": "available",
+    "quota": "1000 hours/month",
+    "note": "Free tier GPU instances",
+    "link": "https://example.com/gpu"
+  }'
+```

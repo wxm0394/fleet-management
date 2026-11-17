@@ -70,6 +70,19 @@ type ComposeStackRecord struct {
 	UpdatedAt   int64  `json:"updated_at"`
 }
 
+type FreeResourceRecord struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Category  string `json:"category"`
+	Status    string `json:"status"`
+	ExpiresAt int64  `json:"expires_at"`
+	Quota     string `json:"quota"`
+	Note      string `json:"note"`
+	Link      string `json:"link"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
 func NewSQLiteStore(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -146,11 +159,111 @@ func NewSQLiteStore(dbPath string) (*Store, error) {
 		status TEXT DEFAULT 'pending',
 		updated_at INTEGER NOT NULL
 	) WITHOUT ROWID;
+
+	CREATE TABLE IF NOT EXISTS free_resources (
+		id TEXT PRIMARY KEY NOT NULL,
+		name TEXT NOT NULL,
+		category TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active',
+		expires_at INTEGER,
+		quota TEXT,
+		note TEXT,
+		link TEXT,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	) WITHOUT ROWID;
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := s.SeedFreeResources(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// FreeResource CRUD
+
+func (s *Store) CreateFreeResource(name, category, status string, expiresAt *time.Time, quota, note, link string) (string, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().Unix()
+	var expiresAtVal interface{}
+	if expiresAt != nil {
+		expiresAtVal = expiresAt.Unix()
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO free_resources (id, name, category, status, expires_at, quota, note, link, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id.String(), name, category, status, expiresAtVal, quota, note, link, now, now,
+	)
+	if err != nil {
+		return "", err
+	}
+	return id.String(), nil
+}
+
+func (s *Store) GetFreeResource(id string) (*FreeResourceRecord, error) {
+	row := s.db.QueryRow(`SELECT id, name, category, status, expires_at, quota, note, link, created_at, updated_at FROM free_resources WHERE id = ?`, id)
+	var r FreeResourceRecord
+	err := row.Scan(&r.ID, &r.Name, &r.Category, &r.Status, &r.ExpiresAt, &r.Quota, &r.Note, &r.Link, &r.CreatedAt, &r.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) ListFreeResources(category, status *string) ([]FreeResourceRecord, error) {
+	query := `SELECT id, name, category, status, expires_at, quota, note, link, created_at, updated_at FROM free_resources`
+	args := []interface{}{}
+	if category != nil {
+		query += ` WHERE category = ?`
+		args = append(args, *category)
+	}
+	if status != nil {
+		if len(args) > 0 {
+			query += ` AND status = ?`
+		} else {
+			query += ` WHERE status = ?`
+		}
+		args = append(args, *status)
+	}
+	query += ` ORDER BY expires_at ASC NULLS LAST`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []FreeResourceRecord
+	for rows.Next() {
+		var r FreeResourceRecord
+		if err := rows.Scan(&r.ID, &r.Name, &r.Category, &r.Status, &r.ExpiresAt, &r.Quota, &r.Note, &r.Link, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, r)
+	}
+	return list, nil
+}
+
+func (s *Store) UpdateFreeResource(id, name, category, status string, expiresAt *time.Time, quota, note, link string) error {
+	now := time.Now().Unix()
+	var expiresAtVal interface{}
+	if expiresAt != nil {
+		expiresAtVal = expiresAt.Unix()
+	}
+	_, err := s.db.Exec(
+		`UPDATE free_resources SET name = ?, category = ?, status = ?, expires_at = ?, quota = ?, note = ?, link = ?, updated_at = ? WHERE id = ?`,
+		name, category, status, expiresAtVal, quota, note, link, now, id,
+	)
+	return err
+}
+
+func (s *Store) DeleteFreeResource(id string) error {
+	_, err := s.db.Exec(`DELETE FROM free_resources WHERE id = ?`, id)
+	return err
 }
 
 // CreateBootstrapToken 生成一次性节点注册 Token（基于 UUIDv7）
