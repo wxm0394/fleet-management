@@ -320,6 +320,8 @@ func main() {
 	mux.HandleFunc("/api/v1/dns-providers", cp.handleDNSProviders)
 	mux.HandleFunc("/api/v1/certificates", cp.handleCertificates)
 	mux.HandleFunc("/api/v1/routes", cp.handleProxyRoutes)
+	mux.HandleFunc("/api/v1/resources", cp.handleResources)
+	mux.HandleFunc("POST /api/v1/resources/sync-notion", cp.handleNotionSync)
 	mux.HandleFunc("PUT /api/v1/nodes/{id}/tags", cp.handleNodeTags)
 	mux.HandleFunc("GET /api/v1/stacks", cp.handleListStacks)
 	mux.HandleFunc("POST /api/v1/stacks", cp.handleCreateStack)
@@ -341,6 +343,39 @@ func main() {
 
 	<-stop
 	log.Println("[INFO] Shutting down Control Plane...")
+}
+
+func (cp *ControlPlane) handleResources(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		resources, err := cp.store.ListFreeResources(nil, nil)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resources)
+	case http.MethodPost:
+		var req struct {
+			Name     string `json:"name"`
+			Category string `json:"category"`
+			Status   string `json:"status"`
+			Quota    string `json:"quota"`
+			Note     string `json:"note"`
+			Link     string `json:"link"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		id, err := cp.store.CreateFreeResource(req.Name, req.Category, req.Status, nil, req.Quota, req.Note, req.Link)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+	}
 }
 
 func (cp *ControlPlane) handleServerInfo(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +485,37 @@ echo "[+] Fleet Agent installation complete!"
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="install.sh"`)
 	_, _ = w.Write(buf.Bytes())
+}
+
+func (cp *ControlPlane) handleNotionSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ResourceID   string `json:"resource_id"`
+		NotionPageID string `json:"notion_page_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Fetch the resource from the database
+	_, err := cp.store.GetFreeResource(req.ResourceID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// TODO: Implement Notion sync logic here
+	// For example, update the Notion page with the resource data
+	// Use Notion API client to make the request
+	// Handle errors and return appropriate responses
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "notion sync endpoint ready - implementation pending"})
 }
 
 func (cp *ControlPlane) handleRegister(w http.ResponseWriter, r *http.Request) {
